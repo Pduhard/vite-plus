@@ -3,9 +3,7 @@ import path from 'node:path';
 
 import { withConfigMetadataResolution } from './define-config.ts';
 import { VITE_CONFIG_FILES } from './utils/constants.ts';
-import { findWorkspaceRoot } from './utils/workspace-root.ts';
-
-export { findWorkspaceRoot };
+import { findWorkspaceRoot } from './utils/package.ts';
 
 /**
  * Find a vite config file by walking up from `startDir` to `stopDir`.
