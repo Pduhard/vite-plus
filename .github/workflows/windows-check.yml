@@ -1,0 +1,273 @@
+name: Windows check
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - ci/windows-check
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-check-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  unit-specs:
+    name: Unit specs (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+          package-manager-cache: false
+
+      - name: Set up a standalone copy of packages/cli/src with the catalog vitest
+        run: |
+          catalog() { grep -E "^  $1: " pnpm-workspace.yaml | head -1 | sed -E "s/^  $1: *=?//"; }
+          S="$(cygpath -u "$RUNNER_TEMP")/specs"
+          mkdir -p "$S/cli"
+          cp -r packages/cli/src packages/cli/package.json "$S/cli/"
+          cd "$S"
+          echo '{"name":"specs","private":true,"type":"module"}' > package.json
+          npm install --no-audit --no-fund \
+            "vitest@$(catalog vitest)" \
+            "oxlint@$(catalog oxlint)" \
+            "oxfmt@$(catalog oxfmt)" \
+            "oxlint-tsgolint@$(catalog oxlint-tsgolint)" \
+            "detect-indent@$(catalog detect-indent)" \
+            "detect-newline@$(catalog detect-newline)" \
+            "jsonc-parser@$(catalog jsonc-parser)" \
+            "@voidzero-dev/vite-task-client@$(node -p "require('./cli/package.json').devDependencies['@voidzero-dev/vite-task-client']")"
+          echo "SPECS_DIR=$S" >> "$GITHUB_ENV"
+
+      - name: Run resolve-project-tool and resolve-lint specs
+        run: |
+          cd "$SPECS_DIR"
+          npx vitest run \
+            cli/src/utils/__tests__/resolve-project-tool.spec.ts \
+            cli/src/__tests__/resolve-lint.spec.ts
+
+      - name: Run resolve-vite-config spec (uses the moved findWorkspaceRoot)
+        continue-on-error: true
+        run: |
+          cd "$SPECS_DIR"
+          npx vitest run cli/src/__tests__/resolve-vite-config.spec.ts
+
+      # vp itself refuses to run outside a package ("Package not found in workspace"),
+      # so the walk up to a drive root with no package.json is checked on the resolver directly.
+      - name: Resolve from a folder with no package.json up to the drive root
+        run: |
+          WS_DRV="$(node -p "process.cwd().slice(0,2)")"
+          OTHER_DRV="C:"; [ "$WS_DRV" = "C:" ] && OTHER_DRV="D:"
+          mkdir -p "$OTHER_DRV/nopkg/sub"
+          cd "$OTHER_DRV/nopkg/sub"
+          node --input-type=module -e '
+            import { pathToFileURL } from "node:url";
+            const src = process.argv[1];
+            const { resolveProjectTool } = await import(pathToFileURL(src + "/cli/src/utils/resolve-project-tool.ts"));
+            const { findWorkspaceRoot } = await import(pathToFileURL(src + "/cli/src/utils/package.ts"));
+            const { resolveBundled } = await import(pathToFileURL(src + "/cli/src/utils/constants.ts"));
+            const cwd = process.cwd();
+            const results = [
+              ["findWorkspaceRoot(" + cwd + ")", findWorkspaceRoot(cwd), undefined],
+              ["resolveProjectTool(oxlint) from " + cwd, resolveProjectTool("oxlint"), resolveBundled("oxlint")],
+            ];
+            let failed = false;
+            for (const [name, got, want] of results) {
+              const ok = got === want;
+              failed ||= !ok;
+              console.log((ok ? "PASS" : "FAIL") + " [" + name + "] expected=" + want + " got=" + got);
+            }
+            process.exit(failed ? 1 : 0);
+          ' "$(cygpath -m "$SPECS_DIR")"
+
+  build-dist:
+    name: Build packages/cli dist (Linux, JS only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/clone
+
+      - uses: ./.github/actions/setup-ci-node
+
+      - uses: ./.github/actions/download-rolldown-binaries
+        with:
+          github-token: ${{ github.token }}
+          upload: 'false'
+
+      - name: Brand vite
+        run: pnpm exec tool brand-vite
+
+      - name: Build upstream TypeScript packages
+        run: |
+          pnpm --filter rolldown build-node
+          pnpm --filter vite build-types
+          pnpm --filter "@voidzero-dev/*" build
+
+      - name: Build vite-plus TypeScript
+        run: pnpm --filter vite-plus build-ts
+
+      - name: Check the dist carries the fix
+        run: grep -rl "function resolveProjectTool" packages/cli/dist
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cli-dist
+          path: packages/cli/dist
+          if-no-files-found: error
+
+  e2e:
+    name: End to end (Windows)
+    needs: build-dist
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Pduhard/repro-vite-plus-lint-overrides
+          path: repro
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: cli-dist
+          path: cli-dist
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Install pnpm
+        run: |
+          npm install -g pnpm@12.11.2
+          pnpm --version
+
+      - name: Run the scenarios
+        run: |
+          set -euo pipefail
+          FAILED=0
+          DIST="$(cygpath -m "$GITHUB_WORKSPACE")/cli-dist"
+          E="$(cygpath -u "$RUNNER_TEMP")/e2e"
+          DRV="$(node -p "process.cwd().slice(0,2)")"
+          PNPM_INSTALL=(pnpm install --config.minimum-release-age=0)
+          mkdir -p "$E"
+
+          json() { node -e "require('fs').writeFileSync(process.argv[1], JSON.stringify(JSON.parse(process.argv[2]), null, 2))" "$1" "$2"; }
+          version_of() { local v; v="$(grep -oE 'Version: [0-9]+\.[0-9]+\.[0-9]+' <<<"$1" | head -1 | cut -d' ' -f2)"; [ -n "$v" ] || v="$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+' <<<"$1" | head -1)"; echo "$v"; }
+          errors_of() { grep -oE '[0-9]+ errors?' <<<"$1" | tail -1 | grep -oE '[0-9]+'; }
+          vp() { local cwd="$1" bin="$2"; shift 2; (cd "$cwd" && "$bin" "$@" 2>&1); }
+          show() { echo "----- $1"; echo "$2" | sed 's/^/    /'; }
+          # expect <name> <unpatched expectation> <patched expectation> <actual>; only patched results gate the job
+          expect() {
+            local want="$3"
+            if [ "$MODE" = unpatched ]; then
+              want="$2"
+              if [ "$want" = "$4" ]; then echo "UNPATCHED-AS-EXPECTED [$1] expected=$want got=$4"; else echo "UNPATCHED-DIFF [$1] expected=$want got=$4"; fi
+              return
+            fi
+            if [ "$want" = "$4" ]; then echo "PASS [$1] expected=$want got=$4"; else echo "FAIL [$1] expected=$want got=$4"; FAILED=1; fi
+          }
+
+          echo "::group::Install scenarios"
+          # A: the repro: parent with oxlint 1.60.0 + .oxlintrc.json, app/ with vite-plus 1.2.0
+          cp -r repro "$E/A"
+          (cd "$E/A" && "${PNPM_INSTALL[@]}" --frozen-lockfile && cd app && "${PNPM_INSTALL[@]}" --frozen-lockfile)
+
+          # B: pnpm workspace whose root declares oxlint 1.60.0; vp runs from a sub-package
+          mkdir -p "$E/B/packages/a/src/deep"
+          json "$E/B/package.json" '{"name":"ws","private":true,"devDependencies":{"oxlint":"1.60.0"}}'
+          printf 'packages:\n  - packages/*\n' > "$E/B/pnpm-workspace.yaml"
+          json "$E/B/packages/a/package.json" '{"name":"a","private":true,"type":"module","devDependencies":{"vite-plus":"1.2.0"}}'
+          (cd "$E/B" && "${PNPM_INSTALL[@]}")
+
+          # C: the project declares and installs oxlint 1.60.0 itself
+          mkdir -p "$E/C/app"
+          json "$E/C/app/package.json" '{"name":"c","private":true,"type":"module","devDependencies":{"vite-plus":"1.2.0","oxlint":"1.60.0"}}'
+          (cd "$E/C/app" && "${PNPM_INSTALL[@]}")
+
+          # F: parent with oxfmt 0.40.0, app/ with vite-plus 1.2.0
+          mkdir -p "$E/F/app"
+          json "$E/F/package.json" '{"name":"f-parent","private":true,"devDependencies":{"oxfmt":"0.40.0"}}'
+          json "$E/F/app/package.json" '{"name":"f","private":true,"type":"module","devDependencies":{"vite-plus":"1.2.0"}}'
+          (cd "$E/F" && "${PNPM_INSTALL[@]}" && cd app && "${PNPM_INSTALL[@]}")
+
+          # D: parent at the drive root (oxlint 1.60.0 in $DRV/node_modules), project at $DRV/vpx
+          # npm cannot install at a drive root (mkdir 'D:\' EPERM): install elsewhere, copy node_modules up
+          json "$DRV/package.json" '{"name":"drive-root","private":true,"devDependencies":{"oxlint":"1.60.0"}}'
+          mkdir -p "$E/D-parent" && cp "$DRV/package.json" "$E/D-parent/"
+          (cd "$E/D-parent" && npm install --no-audit --no-fund)
+          node -e 'require("fs").cpSync(process.argv[1], process.argv[2], { recursive: true })' "$(cygpath -m "$E/D-parent/node_modules")" "$DRV/node_modules"
+          ls "$DRV/node_modules" "$DRV/node_modules/@oxlint"
+          mkdir -p "$DRV/vpx"
+          json "$DRV/vpx/package.json" '{"name":"vpx","private":true,"type":"module","devDependencies":{"vite-plus":"1.2.0"}}'
+          (cd "$DRV/vpx" && "${PNPM_INSTALL[@]}")
+
+          echo "::endgroup::"
+
+          set +e
+          VP_A="./node_modules/.bin/vp"
+          VP_B_DEEP="../../node_modules/.bin/vp"
+
+          run_all() {
+            MODE="$1"
+            local out
+            echo "===== $MODE"
+
+            out="$(vp "$E/A/app" "$VP_A" lint --version)"; show "A lint --version" "$out"
+            expect "A repro: vp lint --version" 1.60.0 1.88.0 "$(version_of "$out")"
+            out="$(vp "$E/A/app" "$VP_A" lint src)"; show "A lint src" "$out"
+            expect "A repro: vp lint src error count" 2 1 "$(errors_of "$out")"
+
+            out="$(vp "$E/B/packages/a" "$VP_A" lint --version)"; show "B lint --version (packages/a)" "$out"
+            expect "B workspace root declares oxlint, vp from packages/a" 1.60.0 1.60.0 "$(version_of "$out")"
+            out="$(vp "$E/B/packages/a/src/deep" "$VP_B_DEEP" lint --version)"; show "B lint --version (packages/a/src/deep)" "$out"
+            expect "B workspace root declares oxlint, vp from packages/a/src/deep" 1.60.0 1.60.0 "$(version_of "$out")"
+
+            out="$(vp "$E/C/app" "$VP_A" lint --version)"; show "C lint --version" "$out"
+            expect "C project declares and installs its own oxlint" 1.60.0 1.60.0 "$(version_of "$out")"
+
+            out="$(vp "$E/F/app" "$VP_A" fmt --version)"; show "F fmt --version" "$out"
+            expect "F parent dir has oxfmt 0.40.0: vp fmt --version" 0.40.0 0.73.0 "$(version_of "$out")"
+
+            out="$(vp "$DRV/vpx" "$VP_A" lint --version)"; show "D lint --version ($DRV/vpx)" "$out"
+            expect "D oxlint in the drive root ($DRV/node_modules): vp lint --version" 1.60.0 1.88.0 "$(version_of "$out")"
+
+          }
+
+          run_all unpatched
+
+          echo "::group::Patch vite-plus 1.2.0 with the branch-built dist"
+          for p in "$E/A/app" "$E/B/packages/a" "$E/C/app" "$E/F/app" "$DRV/vpx"; do
+            node -e '
+              const fs = require("fs"), path = require("path");
+              const pkg = fs.realpathSync(path.join(process.argv[1], "node_modules", "vite-plus"));
+              const dist = path.join(pkg, "dist");
+              if (fs.existsSync(path.join(pkg, "dist.published"))) { console.log("already patched", pkg); process.exit(0); }
+              fs.renameSync(dist, path.join(pkg, "dist.published"));
+              fs.cpSync(process.argv[2], dist, { recursive: true });
+              console.log("patched", pkg);
+            ' "$p" "$DIST"
+          done
+          echo "::endgroup::"
+
+          run_all patched
+
+          echo
+          if [ "$FAILED" = 0 ]; then echo "ALL PATCHED CHECKS PASS"; else echo "SOME CHECKS FAILED"; fi
+          exit "$FAILED"
